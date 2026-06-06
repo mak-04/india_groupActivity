@@ -1,0 +1,6 @@
+/uploads/*
+!/uploads/.gitkeep
+/storage/sessions/*
+!/storage/sessions/.gitkeep
+
+.env
