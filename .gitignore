@@ -10,3 +10,4 @@ config/config.php
 *.sql
 *.sqlite
 *.db
+database.sql
