@@ -1946,3 +1946,72 @@ ul {
 .error-pill .retry-inline-btn:hover {
   opacity: 0.7;
 }
+
+/* ╔══════════════════════════════════════════════════════╗
+   ║  RATINGS & FEEDBACK                                 ║
+   ╚══════════════════════════════════════════════════════╝ */
+.star-rating .star {
+  font-size: 32px;
+  color: var(--silver);
+  cursor: pointer;
+  transition: color 0.2s, transform 0.1s;
+}
+
+.star-rating .star:hover {
+  transform: scale(1.1);
+}
+
+.star-rating .star.hover,
+.star-rating .star.active {
+  color: var(--gold);
+}
+
+/* ── Toast Notifications ───────────────────────────────── */
+#toastContainer {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 10000;
+  pointer-events: none;
+}
+
+.toast {
+  background: var(--white);
+  color: var(--black);
+  padding: 14px 20px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  font-size: 0.9rem;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transform: translateX(120%);
+  opacity: 0;
+  transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), opacity 0.3s;
+  pointer-events: auto;
+}
+
+.toast.show {
+  transform: translateX(0);
+  opacity: 1;
+}
+
+.toast.success {
+  border-left: 4px solid var(--green);
+}
+
+.toast.success .material-icons {
+  color: var(--green);
+}
+
+.toast.error {
+  border-left: 4px solid var(--red);
+}
+
+.toast.error .material-icons {
+  color: var(--red);
+}

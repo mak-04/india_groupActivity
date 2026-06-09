@@ -8,7 +8,7 @@ if (!$user) {
     exit;
 }
 
-// Redirect to dashboard if already onboarded
+// If they already have both set, go straight to dashboard
 if ($user['birthday'] && $user['gender']) {
     header('Location: dashboard.php');
     exit;
@@ -18,150 +18,79 @@ $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     verify_csrf();
-    $username = trim($_POST['username'] ?? '');
-    $birthday = $_POST['birthday'] ?? '';
-    $gender   = $_POST['gender'] ?? '';
+    $birthday = trim($_POST['birthday'] ?? '');
+    $gender = trim($_POST['gender'] ?? '');
 
-    if ($username === '' || $birthday === '' || $gender === '') {
-        $error = 'All fields are required.';
+    if ($birthday === '' || $gender === '') {
+        $error = 'Please fill in both your birthday and gender.';
     } else {
         try {
-            $stmt = db()->prepare('UPDATE users SET username = ?, birthday = ?, gender = ? WHERE id = ?');
-            $stmt->execute([$username, $birthday, $gender, $user['id']]);
+            $stmt = db()->prepare('UPDATE users SET birthday = ?, gender = ? WHERE id = ?');
+            $stmt->execute([$birthday, $gender, $user['id']]);
             header('Location: dashboard.php');
             exit;
         } catch (Throwable $e) {
-            $error = 'An error occurred: ' . $e->getMessage();
+            $error = 'Failed to update profile. Please try again.';
         }
     }
 }
+
 ?>
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Complete Profile — <?= APP_NAME ?></title>
+  <title>Complete Your Profile — <?= APP_NAME ?></title>
   <link rel="icon" type="image/png" href="assets/img/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-  <link rel="stylesheet" href="assets/css/style.css?v=<?= filemtime(__DIR__ . '/assets/css/style.css') ?>">
-  <style>
-    .onboarding-card {
-      background: var(--surface);
-      border-radius: 12px;
-      padding: 40px;
-      width: 100%;
-      max-width: 460px;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-      border: 1px solid rgba(255,255,255,0.05);
-      margin: 40px auto;
-    }
-    .onboarding-card h2 {
-      font-size: 1.6rem;
-      margin-bottom: 8px;
-      font-weight: 600;
-    }
-    .onboarding-card p {
-      color: var(--gray);
-      margin-bottom: 24px;
-      font-size: 0.9rem;
-    }
-    .gender-options {
-      display: flex;
-      gap: 16px;
-      margin-top: 8px;
-    }
-    .gender-options label {
-      flex: 1;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      padding: 12px;
-      background: rgba(255,255,255,0.04);
-      border-radius: 8px;
-      border: 1px solid transparent;
-      cursor: pointer;
-      transition: 0.2s;
-      font-size: 0.95rem;
-      font-weight: 500;
-      color: var(--gray);
-    }
-    .gender-options label:hover {
-      background: rgba(255,255,255,0.08);
-    }
-    .gender-options input[type="radio"] {
-      display: none;
-    }
-    .gender-options input[type="radio"]:checked + span {
-      color: var(--white);
-    }
-    .gender-options label:has(input:checked) {
-      background: rgba(255,255,255,0.12);
-      border-color: var(--gold);
-      color: var(--white);
-    }
-    .onboarding-shell {
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .auth-form label { margin-bottom: 20px; }
-  </style>
+  <link rel="stylesheet" href="assets/css/style.css?v=<?= time() ?>">
 </head>
 <body class="auth-body">
-  <main class="onboarding-shell fade-in">
-    <div class="onboarding-card">
-      <h2>Complete your profile</h2>
-      <p>Tell us a little bit about yourself to get started.</p>
+  <main class="auth-shell fade-in">
+    <!-- Brand panel (left) -->
+    <section class="brand-panel">
+      <div class="logo-mark">
+        <img src="assets/img/logo.png" alt="Study Tracker" class="brand-logo-img">
+      </div>
+      <h1>Study<span> Tracker</span></h1>
+      <p>Almost there! Let's get to know you better.</p>
+    </section>
 
-      <?php if ($error): ?>
-        <div class="alert error"><?= e($error) ?></div>
-      <?php endif; ?>
-
+    <!-- Auth card (right) -->
+    <section class="auth-card">
       <form class="auth-form" method="post" action="onboarding.php">
         <input type="hidden" name="csrf_token" value="<?= csrf_token() ?>">
-        
-        <label>Username
-          <span class="input-icon">
-            <span class="material-icons">person</span>
-            <input type="text" name="username" required value="<?= e($user['username']) ?>" placeholder="Choose a username">
-          </span>
-        </label>
+        <h2>Complete Profile</h2>
+        <p style="color:var(--gray);font-size:0.9rem;margin-bottom:24px">Please provide your birthday and gender to finish setting up your account.</p>
+
+        <?php if ($error): ?>
+          <div class="alert error"><?= e($error) ?></div>
+        <?php endif; ?>
 
         <label>Birthday
-          <span class="input-icon">
-            <span class="material-icons">cake</span>
-            <input type="date" name="birthday" required>
+          <span class="input-icon" style="padding:0">
+            <input type="date" name="birthday" required style="width:100%; padding:12px 14px; background:rgba(0,0,0,0.03); border:1px solid rgba(0,0,0,0.1); border-radius:8px; color:var(--black); font-size:0.9rem; outline:none; transition:border-color 0.2s, box-shadow 0.2s;" onfocus="this.style.borderColor='var(--blue)'; this.style.boxShadow='0 0 0 3px rgba(32,88,220,0.15)';" onblur="this.style.borderColor='rgba(0,0,0,0.1)'; this.style.boxShadow='none';">
           </span>
         </label>
 
-        <label style="margin-bottom: 32px">Gender
-          <div class="gender-options">
-            <label>
-              <input type="radio" name="gender" value="Male" required>
-              <span>Male</span>
-            </label>
-            <label>
-              <input type="radio" name="gender" value="Female" required>
-              <span>Female</span>
-            </label>
-            <label>
-              <input type="radio" name="gender" value="Other" required>
-              <span>Other</span>
-            </label>
-          </div>
+        <label>Gender
+          <span class="input-icon" style="padding:0">
+            <select name="gender" required style="width:100%; padding:12px 14px; background:rgba(0,0,0,0.03); border:1px solid rgba(0,0,0,0.1); border-radius:8px; color:var(--black); font-size:0.9rem; outline:none; transition:border-color 0.2s, box-shadow 0.2s; cursor:pointer; appearance:none; -webkit-appearance:none; background-image:url('data:image/svg+xml;utf8,<svg fill=%22%23737373%22 height=%2224%22 viewBox=%220 0 24 24%22 width=%2224%22 xmlns=%22http://www.w3.org/2000/svg%22><path d=%22M7 10l5 5 5-5z%22/></svg>'); background-repeat:no-repeat; background-position-x:calc(100% - 12px); background-position-y:50%;" onfocus="this.style.borderColor='var(--blue)'; this.style.boxShadow='0 0 0 3px rgba(32,88,220,0.15)';" onblur="this.style.borderColor='rgba(0,0,0,0.1)'; this.style.boxShadow='none';">
+              <option value="" disabled selected>Select Gender</option>
+              <option value="Male">Male</option>
+              <option value="Female">Female</option>
+              <option value="Prefer Not To Say">Prefer Not To Say</option>
+            </select>
+          </span>
         </label>
 
-        <button class="primary-btn ripple" type="submit" style="width: 100%">Get Started</button>
+        <button class="primary-btn ripple" type="submit" style="margin-top:16px">Proceed to Dashboard</button>
       </form>
-    </div>
+    </section>
   </main>
 </body>
 </html>

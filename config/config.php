@@ -23,7 +23,20 @@ if (file_exists($envPath)) {
     }
 }
 
-define('GEMINI_API_KEY', getenv('GEMINI_API_KEY') ?: 'YOUR_GEMINI_API_KEY_HERE');
+/**
+ * ── GEMINI API CONFIGURATION ───────────────────────────────────────────────
+ * Set environment variables OR replace 'YOUR_GEMINI_API_KEY_HERE' below.
+ * Get a free API key: https://aistudio.google.com/
+ *
+ * Free-tier models confirmed working as of June 2026:
+ *   gemini-2.5-flash      → 10 RPM / 1,500 RPD  ← recommended default
+ *   gemini-2.5-flash-lite → 15 RPM / higher RPD  ← automatic fallback
+ *
+ * DEAD MODELS (shut down — do NOT use):
+ *   gemini-1.5-flash, gemini-1.5-pro  → shut down, return 404
+ *   gemini-2.0-flash, gemini-2.0-flash-lite → shut down June 1, 2026
+ */
+define('GEMINI_API_KEY', getenv('GEMINI_API_KEY') ?: '');
 define('GEMINI_MODEL',   getenv('GEMINI_MODEL')   ?: 'gemini-2.5-flash');
 
 define('HOURLY_AI_LIMIT', 20);
@@ -67,6 +80,56 @@ function db(): PDO
     return $pdo;
 }
 
+function ensure_feedback_schema(): void
+{
+    static $done = false;
+    if ($done) { return; }
+
+    $pdo = db();
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS feedback (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            user_id     INT          DEFAULT NULL,
+            message     TEXT         NOT NULL,
+            rating      TINYINT(1)   DEFAULT NULL COMMENT '1-5 stars, NULL = no rating',
+            is_reviewed TINYINT(1)   NOT NULL DEFAULT 0,
+            is_archived TINYINT(1)   NOT NULL DEFAULT 0,
+            sentiment   ENUM('positive','neutral','negative') DEFAULT 'neutral',
+            created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+        )"
+    );
+
+    $columns = [];
+    foreach ($pdo->query('SHOW COLUMNS FROM feedback')->fetchAll() as $column) {
+        $columns[$column['Field']] = true;
+    }
+
+    if (empty($columns['rating'])) {
+        $pdo->exec("ALTER TABLE feedback ADD COLUMN rating TINYINT(1) DEFAULT NULL COMMENT '1-5 stars, NULL = no rating' AFTER message");
+    }
+    if (empty($columns['is_reviewed'])) {
+        $pdo->exec("ALTER TABLE feedback ADD COLUMN is_reviewed TINYINT(1) NOT NULL DEFAULT 0 AFTER rating");
+    }
+    if (empty($columns['is_archived'])) {
+        $pdo->exec("ALTER TABLE feedback ADD COLUMN is_archived TINYINT(1) NOT NULL DEFAULT 0 AFTER is_reviewed");
+    }
+    if (empty($columns['sentiment'])) {
+        $pdo->exec("ALTER TABLE feedback ADD COLUMN sentiment ENUM('positive','neutral','negative') DEFAULT 'neutral' AFTER is_archived");
+    }
+
+    $done = true;
+}
+
+function feedback_sentiment(?int $rating, string $message = ''): string
+{
+    if ($rating !== null) {
+        if ($rating >= 4) { return 'positive'; }
+        if ($rating <= 2) { return 'negative'; }
+    }
+    return 'neutral';
+}
+
 /* ── Helper Functions ─────────────────────────────────────── */
 function e(?string $value): string
 {
@@ -93,7 +156,12 @@ function verify_csrf(): void
 function current_user(): ?array
 {
     if (empty($_SESSION['user_id'])) { return null; }
-    $stmt = db()->prepare('SELECT id, username, email, birthday, gender, created_at FROM users WHERE id = ?');
+    $stmt = db()->prepare('
+        SELECT u.id, u.username, u.email, u.birthday, u.gender, u.created_at, COALESCE(up.is_suspended, 0) AS is_suspended
+        FROM users u
+        LEFT JOIN user_profiles up ON up.user_id = u.id
+        WHERE u.id = ?
+    ');
     $stmt->execute([$_SESSION['user_id']]);
     return $stmt->fetch() ?: null;
 }
@@ -104,6 +172,10 @@ function require_login(): array
     if (!$user) {
         http_response_code(401);
         exit(json_encode(['ok' => false, 'message' => 'Please login first.']));
+    }
+    if (!empty($user['is_suspended'])) {
+        http_response_code(403);
+        exit(json_encode(['ok' => false, 'suspended' => true, 'message' => 'Your account has been suspended by the administrator.']));
     }
     return $user;
 }

@@ -6,6 +6,27 @@ if (!$user) {
     header('Location: index.php?mode=login');
     exit;
 }
+if (!empty($user['is_suspended'])) {
+    ?>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <title>Account Suspended</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="assets/css/style.css">
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+    </head>
+    <body style="display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bg);font-family:'Poppins', sans-serif;margin:0;">
+        <div style="background:#fff;padding:40px;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,0.1);max-width:400px;text-align:center;width:90%">
+            <h2 style="color:var(--red);margin-bottom:15px;font-size:1.5rem">Account Suspended</h2>
+            <p style="color:var(--gray);margin-bottom:30px;font-size:0.95rem">Your account has been suspended by the administrator. You cannot access this application.</p>
+            <button class="primary-btn ripple" onclick="window.location.href='logout.php';" style="width:100%;padding:12px;background:var(--blue);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;">OK</button>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
 if (!$user['birthday'] || !$user['gender']) {
     header('Location: onboarding.php');
     exit;
@@ -209,6 +230,16 @@ $firstName = explode(' ', $user['username'])[0];
           <div class="settings-row">
             <label>Daily Limit</label>
             <span><?= DAILY_AI_LIMIT ?> requests/day</span>
+          </div>
+        </div>
+
+        <!-- ── RATINGS & FEEDBACK ────────────────────────────── -->
+        <div class="settings-section">
+          <h3>Ratings & Feedback</h3>
+          <p style="font-size:0.8rem;color:var(--gray);margin-bottom:12px">Help us improve by rating your experience or sending feedback.</p>
+          <div style="display:flex;gap:12px;margin-top:12px">
+            <button class="primary-btn ripple" id="openRateUsBtn" style="flex:1;background:var(--blue);padding:10px;font-size:0.9rem">Rate Us</button>
+            <button class="primary-btn ripple" id="openFeedbackBtn" style="flex:1;background:var(--black);padding:10px;font-size:0.9rem">Send Feedback</button>
           </div>
         </div>
 
@@ -451,6 +482,58 @@ $firstName = explode(' ', $user['username'])[0];
       <div class="modal-actions" style="display:flex; gap:12px; margin-top:0;">
         <button class="btn-cancel ripple" id="cancelDeleteAccount" style="flex:1; padding:12px; font-weight:600; border-radius:8px;">Cancel</button>
         <button class="btn-danger ripple" id="confirmDeleteAccount" style="flex:1; padding:12px; font-weight:600; border-radius:8px; display:flex; justify-content:center; align-items:center; gap:6px;">Delete Account</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rate Us Modal -->
+  <div class="modal-overlay" id="rateUsModal" style="display:none; z-index: 9999;">
+    <div class="modal-card" style="max-width: 440px; padding: 32px;">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 16px;">
+        <h3 style="margin:0; font-size:1.4rem; font-weight:700;">Rate Your Experience</h3>
+        <button id="closeRateUsModal" style="background:transparent; border:none; cursor:pointer; color:var(--gray); padding:4px; transition:color 0.2s;" onmouseover="this.style.color='var(--black)'" onmouseout="this.style.color='var(--gray)'">
+          <span class="material-icons" style="font-size:20px;">close</span>
+        </button>
+      </div>
+      <p style="margin-bottom:24px; font-size:0.95rem; color:var(--gray);">How would you rate your experience with our platform?</p>
+      
+      <div class="star-rating" id="starRatingContainer" style="display:flex; justify-content:center; gap:8px; margin-bottom:16px;">
+        <span class="material-icons star" data-value="1">star_border</span>
+        <span class="material-icons star" data-value="2">star_border</span>
+        <span class="material-icons star" data-value="3">star_border</span>
+        <span class="material-icons star" data-value="4">star_border</span>
+        <span class="material-icons star" data-value="5">star_border</span>
+      </div>
+      <div id="ratingError" style="color:var(--red); font-size:0.85rem; text-align:center; height:20px; margin-bottom:16px;"></div>
+      
+      <div class="modal-actions" style="display:flex; gap:12px; margin-top:0;">
+        <button class="btn-cancel ripple" id="cancelRateUs" style="flex:1; padding:12px; font-weight:600; border-radius:8px;">Cancel</button>
+        <button class="primary-btn ripple" id="submitRateUs" style="flex:1; padding:12px; font-weight:600; border-radius:8px; display:flex; justify-content:center; align-items:center; background:var(--blue);">Submit</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Send Feedback Modal -->
+  <div class="modal-overlay" id="sendFeedbackModal" style="display:none; z-index: 9999;">
+    <div class="modal-card" style="max-width: 480px; padding: 32px;">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 16px;">
+        <h3 style="margin:0; font-size:1.4rem; font-weight:700;">Send Feedback</h3>
+        <button id="closeFeedbackModal" style="background:transparent; border:none; cursor:pointer; color:var(--gray); padding:4px; transition:color 0.2s;" onmouseover="this.style.color='var(--black)'" onmouseout="this.style.color='var(--gray)'">
+          <span class="material-icons" style="font-size:20px;">close</span>
+        </button>
+      </div>
+      <p style="margin-bottom:20px; font-size:0.95rem; color:var(--gray);">Tell us how we can improve.</p>
+      
+      <div style="margin-bottom: 24px; position:relative;">
+        <textarea id="feedbackTextarea" rows="5" placeholder="Enter your feedback here..." style="width:100%; padding:12px 14px; background:rgba(0,0,0,0.03); border:1px solid rgba(0,0,0,0.1); border-radius:8px; color:var(--black); font-size:0.9rem; transition:border-color 0.2s, box-shadow 0.2s; resize:vertical; font-family:inherit;" onfocus="this.style.borderColor='var(--blue)'; this.style.boxShadow='0 0 0 3px rgba(32,88,220,0.15)';" onblur="this.style.borderColor='rgba(0,0,0,0.1)'; this.style.boxShadow='none';"></textarea>
+        <div style="display:flex; justify-content:flex-end; margin-top:6px;">
+          <span id="feedbackWordCount" style="font-size:0.8rem; color:var(--gray); font-weight:500;">0 / 300 words</span>
+        </div>
+      </div>
+      
+      <div class="modal-actions" style="display:flex; gap:12px; margin-top:0;">
+        <button class="btn-cancel ripple" id="cancelFeedback" style="flex:1; padding:12px; font-weight:600; border-radius:8px;">Cancel</button>
+        <button class="primary-btn ripple" id="submitFeedback" disabled style="flex:1; padding:12px; font-weight:600; border-radius:8px; display:flex; justify-content:center; align-items:center; background:var(--blue); opacity:0.5; cursor:not-allowed;">Submit</button>
       </div>
     </div>
   </div>

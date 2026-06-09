@@ -75,8 +75,8 @@ try {
                 $check = db()->prepare('SELECT id FROM history WHERE id = ? AND user_id = ?');
                 $check->execute([$id, $user['id']]);
                 if ($check->fetch()) {
-                    $stmt = db()->prepare('UPDATE history SET title = ?, content = ? WHERE id = ?');
-                    $stmt->execute([$title, $content, $id]);
+                    $stmt = db()->prepare('UPDATE history SET content = ? WHERE id = ?');
+                    $stmt->execute([$content, $id]);
                 } else {
                     // Fallback if ID invalid or unowned
                     db()->prepare('INSERT INTO history (user_id, title, content) VALUES (?, ?, ?)')
@@ -167,9 +167,28 @@ try {
         $check->execute([$histId, $user['id']]);
         $item   = $check->fetch();
         if (!$item) throw new RuntimeException('Session not found.');
+        if (($item['generation_status'] ?? '') === 'processing') {
+            throw new RuntimeException('Cannot archive while AI is generating. Please wait for it to finish.');
+        }
+
+        $content = json_decode($item['content'] ?? '[]', true);
+        if (is_array($content)) {
+            foreach ($content as $msg) {
+                if (($msg['type'] ?? '') === 'quiz') {
+                    $isCompleted = !empty($msg['quizState']['completed']);
+                    if (!$isCompleted) {
+                        throw new RuntimeException('Cannot archive a session with an unfinished quiz. Please finish the quiz first.');
+                    }
+                }
+            }
+        }
+
+        // Preserve generation_status: if still processing, mark as pending_retry
+        // since the background worker references the old history ID which will be deleted
+        $archiveStatus = ($item['generation_status'] ?? 'idle') === 'processing' ? 'pending_retry' : ($item['generation_status'] ?? 'idle');
         db()->beginTransaction();
         try {
-            db()->prepare('INSERT INTO archive (user_id, title, content) VALUES (?, ?, ?)')->execute([$user['id'], $item['title'], $item['content']]);
+            db()->prepare('INSERT INTO archive (user_id, title, content, generation_status) VALUES (?, ?, ?, ?)')->execute([$user['id'], $item['title'], $item['content'], $archiveStatus]);
             db()->prepare('DELETE FROM pinned WHERE user_id = ? AND history_id = ?')->execute([$user['id'], $histId]);
             db()->prepare('DELETE FROM history WHERE id = ? AND user_id = ?')->execute([$histId, $user['id']]);
             db()->commit();
@@ -209,13 +228,16 @@ try {
         $check->execute([$archId, $user['id']]);
         $item   = $check->fetch();
         if (!$item) throw new RuntimeException('Archived session not found.');
+        // Restore generation_status so frontend can detect interrupted generations
+        $restoreStatus = $item['generation_status'] ?? 'idle';
         db()->beginTransaction();
         try {
-            db()->prepare('INSERT INTO history (user_id, title, content) VALUES (?, ?, ?)')->execute([$user['id'], $item['title'], $item['content']]);
+            db()->prepare('INSERT INTO history (user_id, title, content, generation_status) VALUES (?, ?, ?, ?)')->execute([$user['id'], $item['title'], $item['content'], $restoreStatus]);
+            $newHistoryId = (int) db()->lastInsertId();
             db()->prepare('DELETE FROM archive WHERE id = ? AND user_id = ?')->execute([$archId, $user['id']]);
             db()->commit();
         } catch (\Throwable $e) { db()->rollBack(); throw $e; }
-        echo json_encode(['ok' => true]);
+        echo json_encode(['ok' => true, 'new_id' => $newHistoryId]);
         exit;
     }
 
@@ -276,6 +298,61 @@ try {
         $pct   = round(($score / $total) * 100, 2);
         db()->prepare('INSERT INTO quiz_scores (user_id, score, total_questions, percentage) VALUES (?, ?, ?, ?)')->execute([$user['id'], $score, $total, $pct]);
         echo json_encode(['ok' => true, 'percentage' => $pct]);
+        exit;
+    }
+
+    if ($action === 'submit_rating') {
+        $input  = json_request_body();
+        $rating = (int) ($input['rating'] ?? $_POST['rating'] ?? 0);
+
+        if ($rating < 1 || $rating > 5) {
+            throw new RuntimeException('Please select a rating from 1 to 5 stars.');
+        }
+
+        ensure_feedback_schema();
+        $stmt = db()->prepare('SELECT message FROM feedback WHERE user_id = ?');
+        $stmt->execute([$user['id']]);
+        $existing = $stmt->fetch();
+        
+        if ($existing) {
+            db()->prepare('UPDATE feedback SET rating = ?, sentiment = ?, is_reviewed = 0, is_archived = 0, created_at = CURRENT_TIMESTAMP WHERE user_id = ?')
+               ->execute([$rating, feedback_sentiment($rating, (string)$existing['message']), $user['id']]);
+        } else {
+            db()->prepare('INSERT INTO feedback (user_id, message, rating, sentiment) VALUES (?, ?, ?, ?)')
+               ->execute([$user['id'], '', $rating, feedback_sentiment($rating)]);
+        }
+
+        echo json_encode(['ok' => true, 'message' => 'Thank you for your rating!']);
+        exit;
+    }
+
+    if ($action === 'submit_feedback') {
+        $input   = json_request_body();
+        $message = trim((string) ($input['message'] ?? $_POST['message'] ?? ''));
+        $words   = preg_split('/\s+/', $message, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+
+        if ($message === '') {
+            throw new RuntimeException('Feedback cannot be empty.');
+        }
+        if (count($words) > 300) {
+            throw new RuntimeException('Feedback must be 300 words or fewer.');
+        }
+
+        ensure_feedback_schema();
+        $stmt = db()->prepare('SELECT rating FROM feedback WHERE user_id = ?');
+        $stmt->execute([$user['id']]);
+        $existing = $stmt->fetch();
+        
+        if ($existing) {
+            $r = isset($existing['rating']) ? (int)$existing['rating'] : null;
+            db()->prepare('UPDATE feedback SET message = ?, sentiment = ?, is_reviewed = 0, is_archived = 0, created_at = CURRENT_TIMESTAMP WHERE user_id = ?')
+               ->execute([$message, feedback_sentiment($r, $message), $user['id']]);
+        } else {
+            db()->prepare('INSERT INTO feedback (user_id, message, rating, sentiment) VALUES (?, ?, NULL, ?)')
+               ->execute([$user['id'], $message, feedback_sentiment(null, $message)]);
+        }
+
+        echo json_encode(['ok' => true, 'message' => 'Thank you for your feedback!']);
         exit;
     }
 
@@ -493,7 +570,9 @@ try {
             // Append AI message
             if ($mode === 'quiz') {
                 $quizData = json_decode($response, true);
-                if (!$quizData) $quizData = ['questions' => []]; // Fallback
+                if (!$quizData || empty($quizData['questions'])) {
+                    throw new RuntimeException("Could not generate valid quiz questions. Please try again or provide a different topic.");
+                }
                 $messages[] = ['role' => 'ai', 'type' => 'quiz', 'quizData' => $quizData, 'text' => $response];
             } else {
                 $messages[] = ['role' => 'ai', 'type' => 'lesson', 'text' => $response];
@@ -509,17 +588,8 @@ try {
             db()->prepare('UPDATE usage_limits SET hourly_count = GREATEST(0, hourly_count - ?), daily_count = GREATEST(0, daily_count - ?) WHERE user_id = ?')
                ->execute([$cost, $cost, $user['id']]);
 
-            $stmt = db()->prepare('SELECT content FROM history WHERE id = ?');
-            $stmt->execute([$historyId]);
-            $currentContent = $stmt->fetchColumn();
-            $messages = json_decode($currentContent, true) ?: [];
-
-            $timeSuffix = ' <small style="opacity:0.6;font-size:0.75rem;">[' . date('H:i:s') . ']</small>';
-            $errorMsg = '<span class="material-icons" style="font-size:18px;vertical-align:middle;margin-right:4px;color:var(--red)">warning</span> Background generation failed: ' . htmlspecialchars($e->getMessage()) . $timeSuffix . '<br><button class="action-pill ripple" style="margin-top:8px;padding:4px 12px;font-size:0.85rem;background:var(--blue);color:white;border:none;border-radius:20px;cursor:pointer;display:inline-flex;align-items:center;" onclick="window.retryGeneration && window.retryGeneration()"><span class="material-icons" style="font-size:16px;margin-right:4px;">refresh</span> Retry</button>';
-            $messages[] = ['role' => 'ai', 'type' => 'error', 'html' => $errorMsg];
-
-            db()->prepare("UPDATE history SET content = ?, generation_status = 'idle' WHERE id = ?")
-               ->execute([json_encode($messages), $historyId]);
+            db()->prepare("UPDATE history SET generation_status = 'idle' WHERE id = ?")
+               ->execute([$historyId]);
         }
         exit;
     }
@@ -535,6 +605,17 @@ try {
 /* ════════════════════════════════════════════════════════════
    FUNCTIONS
    ════════════════════════════════════════════════════════════ */
+
+function json_request_body(): array
+{
+    static $body = null;
+    if ($body !== null) { return $body; }
+
+    $raw = file_get_contents('php://input');
+    $decoded = $raw !== false && $raw !== '' ? json_decode($raw, true) : [];
+    $body = is_array($decoded) ? $decoded : [];
+    return $body;
+}
 
 function dashboard_stats(int $userId): array
 {
@@ -745,7 +826,7 @@ function call_gemini(string $input, string $mode, ?array $imageData = null): str
         $maxTries = 3;
         for ($try = 1; $try <= $maxTries; $try++) {
             try {
-                return gemini_curl($prompt, $model, $imageData);
+                return gemini_curl($prompt, $model, $imageData, $mode === 'quiz');
             } catch (RuntimeException $e) {
                 $lastErr = $e->getMessage();
                 $lower   = strtolower($lastErr);
@@ -767,7 +848,7 @@ function call_gemini(string $input, string $mode, ?array $imageData = null): str
     throw new RuntimeException($lastErr);
 }
 
-function gemini_curl(string $prompt, string $model, ?array $imageData = null): string
+function gemini_curl(string $prompt, string $model, ?array $imageData = null, bool $isJson = false): string
 {
     $url = 'https://generativelanguage.googleapis.com/v1beta/models/'
          . rawurlencode($model) . ':generateContent';
@@ -779,9 +860,33 @@ function gemini_curl(string $prompt, string $model, ?array $imageData = null): s
     }
     $parts[] = ['text' => $prompt];
 
+    $config = ['temperature' => 0.7, 'maxOutputTokens' => 8192];
+    if ($isJson) {
+        $config['responseMimeType'] = 'application/json';
+        $config['responseSchema'] = [
+            'type' => 'OBJECT',
+            'properties' => [
+                'questions' => [
+                    'type' => 'ARRAY',
+                    'items' => [
+                        'type' => 'OBJECT',
+                        'properties' => [
+                            'question' => ['type' => 'STRING'],
+                            'choices' => ['type' => 'ARRAY', 'items' => ['type' => 'STRING']],
+                            'answer' => ['type' => 'INTEGER'],
+                            'explanation' => ['type' => 'STRING']
+                        ],
+                        'required' => ['question', 'choices', 'answer', 'explanation']
+                    ]
+                ]
+            ],
+            'required' => ['questions']
+        ];
+    }
+
     $payload = json_encode([
         'contents'         => [['parts' => $parts]],
-        'generationConfig' => ['temperature' => 0.7, 'maxOutputTokens' => 8192],
+        'generationConfig' => $config,
     ], JSON_UNESCAPED_UNICODE);
 
     $ch = curl_init($url);
@@ -836,11 +941,13 @@ function lesson_prompt(string $input, bool $fromImage = false): string
         $context = <<<CTX
 The student has uploaded an educational image (lecture slide, textbook page, handwritten notes, diagram, chart, infographic, or whiteboard photo).
 
-Your task:
-1. READ every visible word, number, and label in the image.
-2. ANALYZE any diagrams, flowcharts, tables, or visual relationships.
-3. IDENTIFY all important educational concepts shown.
-4. COVER every major topic from the image — do NOT skip sections.
+OCR AND IMAGE UNDERSTANDING RULES:
+1. Perform OCR extraction — READ every visible word, number, label, and symbol.
+2. Analyze all diagrams, flowcharts, tables, charts, and visual relationships.
+3. Analyze handwritten notes when possible.
+4. IDENTIFY all important educational concepts shown.
+5. COVER every major topic from the image — do NOT skip sections.
+6. Generate lessons based on extracted content, NOT image filenames.
 
 {$input}
 CTX;
@@ -849,50 +956,101 @@ CTX;
     }
 
     return <<<PROMPT
-You are an expert AI Study Tutor, NLP specialist, and educational content architect. Your primary goal is to teach the provided topic or document thoroughly so a student can pass an exam on it.
+You are an advanced Academic Study AI designed to create accurate, comprehensive lessons. Your primary objective is to maximize factual accuracy, content coverage, educational quality, and source fidelity.
 
-CRITICAL DOCUMENT RULES:
-- If a document/text is provided, you MUST prioritize its contents over general knowledge.
-- Read and extract ALL readable content. Identify main topics, subtopics, key concepts, definitions, and examples directly from the material.
-- If the document contains highlighted, colored, bold, underlined, or emphasized text, treat it as high-priority exam material.
-- Include important people, events, dates, and terms exactly as they appear in the material.
-- Do not ignore uploaded content. Do not generate lessons from unrelated topics. Preserve factual accuracy from the source material.
+YOU MUST ALWAYS GENERATE A COMPLETE LESSON. Never ask the user for a document. Never say you cannot generate a lesson. If the user provides a topic, keyword, or subject name — generate a full lesson on that topic using your knowledge.
+
+═══════════════════════════════════════════════
+INPUT MODE DETECTION
+═══════════════════════════════════════════════
+
+There are TWO modes of operation. Detect which one applies:
+
+MODE A — DOCUMENT/FILE PROVIDED:
+If the input below contains substantial text content (paragraphs, definitions, lecture notes, extracted document text), then:
+- This is uploaded document content. Prioritize it over general knowledge.
+- Read and extract ALL content from the material.
+- Capture: definitions, key terms, concepts, explanations, examples, formulas, processes, theories, tables, important notes, citations, quotes, author statements ("According to..."), research findings, historical facts, and conclusions.
+- NEVER generate lessons based solely on file title or document heading.
+- CONTENT PRESERVATION: If the source contains "According to John Smith, motivation is the driving force behind human behavior." — the lesson MUST include that exact statement with attribution.
+- Do NOT remove author attributions, skip definitions, or summarize away important statements.
+- Every important piece of information found in the source must appear in the lesson.
+
+MODE B — TOPIC/KEYWORD ONLY:
+If the input below is a short topic, keyword, or subject name (e.g., "the cold war", "photosynthesis", "Newton's laws"), then:
+- Generate a comprehensive, in-depth lesson on that topic using your academic knowledge.
+- Research the topic thoroughly. Draw from: academic journals, peer-reviewed papers, educational institutions (Harvard, MIT, Stanford), government publications (WHO, UNESCO, NIH), university textbooks, and reputable educational resources.
+- Do NOT use Wikipedia as a primary source. Wikipedia may only be used for basic verification.
+- Include real historical facts, real people, real dates, real theories, and real research findings.
+- Never fabricate information, authors, or citations.
+- The lesson must be detailed enough that a student could pass an exam on the topic.
+
+COMPLETENESS CHECK (apply to BOTH modes):
+Before finalizing the lesson, verify:
+- Did I include all definitions and key terms?
+- Did I include all major concepts and theories?
+- Did I include all important people mentioned or relevant to the topic?
+- Did I include all author statements and research findings?
+- Did I include all significant examples?
+If any important information is missing, revise until coverage is complete.
+
+═══════════════════════════════════════════════
 
 {$context}
 
-Write a comprehensive, well-structured lesson using EXACTLY the following numbered sections. Each section must have substantial content — do NOT skip any section.
+═══════════════════════════════════════════════
+LESSON FORMAT
+═══════════════════════════════════════════════
+
+Generate the lesson using EXACTLY the following sections. Each section must have substantial content — do NOT skip any section.
 
 1. Overview / Introduction
-   - A concise explanation of the document/topic's purpose in simple terms.
-   - Explain why it matters.
+   - A concise explanation of the topic's purpose in simple terms.
+   - Explain why it matters and its relevance.
 
-2. Background & Main Topics
-   - List and explain the major topics discussed in the document/material.
-   - How it connects to related subjects.
+2. Learning Objectives
+   - List clear, measurable objectives the student should achieve after this lesson.
 
-3. Key Concepts, Definitions & Important People
+3. Background & Main Topics
+   - List and explain the major topics and subtopics.
+   - How the topic connects to related subjects.
+
+4. Key Concepts, Definitions & Important People
    - List and explain the most important concepts students should remember.
-   - Extract important definitions EXACTLY as they appear.
-   - If the material mentions inventors, scientists, historical figures, dates, or events, include them.
+   - Include important definitions exactly as they appear in source material (if uploaded), or provide accurate academic definitions (if topic-based).
+   - Include inventors, scientists, historical figures, dates, and events with proper attribution.
 
-4. Step-by-Step Explanation
+5. Theories and Principles
+   - Include ALL relevant theories.
+   - Explain each theory with its originator and significance.
+
+6. Step-by-Step Explanation
    - Break the topic into logical steps or stages.
    - Explain each step in detail. Assume the student is a beginner.
 
-5. Worked Examples & Material Highlights
-   - Extract and explain examples directly from the document.
-   - Emphasize any highlighted, bolded, or callout text found in the material.
+7. Author Statements & Research Findings
+   - For uploaded documents: include all "According to..." statements and preserve exact attributions.
+   - For topic-based lessons: include notable expert opinions, landmark research findings, and scholarly perspectives with proper attribution.
 
-6. Common Mistakes & How to Avoid Them
+8. Worked Examples & Illustrations
+   - For uploaded documents: extract and explain examples directly from the source.
+   - For topic-based lessons: provide clear, practical examples that illustrate key concepts.
+   - Emphasize any highlighted or important material.
+
+9. Common Mistakes & How to Avoid Them
    - List mistakes students typically make on this topic, with correct approaches.
 
-7. Tips & Tricks for Exams
-   - Provide memory aids, mnemonics, or shortcuts relevant to this topic.
-   - Emphasize likely exam material (definitions, formulas, names, dates) based on the document.
+10. Tips & Tricks for Exams
+    - Provide memory aids, mnemonics, or shortcuts relevant to this topic.
+    - Emphasize likely exam material (definitions, formulas, names, dates).
 
-8. Summary & Review
-   - Concise bullet-point recap of everything covered.
-   - The 5 most important things to remember.
+11. Summary & Review
+    - Concise bullet-point recap of everything covered.
+    - The 5 most important things to remember.
+
+12. References
+    - For topic-based lessons: list the academic sources used (Author, Title, Source/URL, Year). Prioritize academic journals, university sources, and government publications. Do NOT cite Wikipedia. Never fabricate references.
+    - For uploaded document lessons: skip this section.
 
 End with exactly this line:
 Would you like to take a quiz on this topic?
@@ -902,23 +1060,67 @@ PROMPT;
 function quiz_prompt(string $input, bool $fromImage = false): string
 {
     $imageNote = $fromImage
-        ? "\nIMPORTANT: All questions must be based directly on the content visible in the uploaded educational image."
-        : "\nIMPORTANT: All questions MUST prioritize and be based directly on the contents of the uploaded document or text provided. Do not use unrelated external information.";
+        ? "\nIMPORTANT: All questions must be based directly on the content visible in the uploaded educational image. Perform OCR to extract all text, then generate questions from the extracted content."
+        : "\nIMPORTANT: If the input is a topic or keyword, generate quiz questions based on comprehensive academic knowledge of that topic. If the input contains uploaded document text, base all questions ONLY on that content. Never ask for additional documents — always generate the quiz.";
     return <<<PROMPT
-You are a quiz generator. Create EXACTLY 20 multiple-choice exam questions based on the study material below.{$imageNote}
+You are an advanced Academic Quiz Generator AI. Create EXACTLY 20 multiple-choice exam questions based on the study material below.{$imageNote}
 
 Return ONLY valid JSON — no markdown, no code fences, no extra text before or after.
 Exact format:
 {"questions":[{"question":"...","choices":["choice text only","choice text only","choice text only","choice text only"],"answer":0,"explanation":"..."}]}
 
-STRICT RULES:
+═══════════════════════════════════════════════
+STRICT RULES
+═══════════════════════════════════════════════
+
+QUESTION GENERATION:
 - Generate EXACTLY 20 questions (not fewer, not more).
 - Each question must have exactly 4 choices.
 - Choices must be PLAIN TEXT ONLY — do NOT include "A.", "B.", "C.", "D." or any letter prefix.
 - "answer" is the 0-based index of the correct choice (0 = first, 1 = second, 2 = third, 3 = fourth).
-- "explanation" briefly explains why the answer is correct (1–2 sentences).
-- Questions must be specific and based directly on the material provided.
-- Vary difficulty: include easy, medium, and challenging questions.
+- "explanation" briefly explains why the answer is correct and references the lesson section it came from (1–2 sentences).
+- The quiz MUST be generated ONLY from the lesson/source content. Never create questions from external information.
+
+DIFFICULTY DISTRIBUTION:
+- Easy (20%): ~4 questions — basic recall of definitions and facts.
+- Medium (50%): ~10 questions — understanding, interpretation, and application.
+- Hard (30%): ~6 questions — analysis, critical thinking, and synthesis.
+- Avoid obvious questions where the answer can be guessed immediately.
+
+QUESTION COVERAGE:
+The quiz must cover ALL of these when present in the source material:
+- Definitions and key terms
+- Key concepts and principles
+- Important people and their contributions
+- Author statements ("According to...")
+- Processes and procedures
+- Theories and frameworks
+- Examples from the source material
+Do NOT generate multiple questions from the same paragraph while ignoring other sections.
+Coverage should be balanced across the ENTIRE lesson.
+
+MULTIPLE CHOICE QUALITY:
+- All options must appear plausible and believable.
+- Only one correct answer per question.
+- Distractors should be realistic — avoid silly or obviously wrong options.
+- Avoid making the correct answer obviously longer than others.
+- Avoid repeating answer position patterns.
+
+ANSWER DISTRIBUTION (CRITICAL):
+- Distribute correct answers evenly across positions: A(0)≈25%, B(1)≈25%, C(2)≈25%, D(3)≈25%.
+- No single position should have more than 35% of correct answers.
+- Randomize answer positions — never create predictable patterns.
+- Before finalizing, check the distribution. If unbalanced, redistribute.
+
+QUALITY VERIFICATION (perform before responding):
+✓ All questions derived from source material only
+✓ No hallucinated or external information
+✓ Balanced difficulty distribution
+✓ Balanced answer position distribution
+✓ Plausible distractors on every question
+✓ No obvious answers
+✓ Coverage spans the entire source material
+✓ Explanations reference the source
 
 Study material / topic:
 {$input}

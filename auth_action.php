@@ -51,12 +51,21 @@ try {
             throw new RuntimeException('Please fill in all fields.');
         }
 
-        $stmt = db()->prepare('SELECT * FROM users WHERE email = ?');
+        $stmt = db()->prepare('
+            SELECT u.*, COALESCE(up.is_suspended, 0) as is_suspended 
+            FROM users u 
+            LEFT JOIN user_profiles up ON up.user_id = u.id 
+            WHERE u.email = ?
+        ');
         $stmt->execute([$email]);
         $user = $stmt->fetch();
 
         if (!$user || !password_verify($pass, $user['password'])) {
             throw new RuntimeException('Invalid email or password.');
+        }
+        
+        if (!empty($user['is_suspended'])) {
+            throw new RuntimeException('You cannot login because your account has been suspended.');
         }
 
         session_regenerate_id(true);

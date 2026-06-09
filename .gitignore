@@ -4,3 +4,9 @@
 !/storage/sessions/.gitkeep
 
 .env
+config/config.php
+
+# Databases and database dumps
+*.sql
+*.sqlite
+*.db

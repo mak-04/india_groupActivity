@@ -39,14 +39,42 @@
 
   /* ── Internet status ─────────────────────────────────────── */
   const netPill = $('netPill');
+  let pendingOfflineRetry = null;
+
   function updateNet() {
     if (!netPill) return;
     if (navigator.onLine) {
       netPill.className = 'net-pill online';
       netPill.innerHTML = '<span class="dot"></span> Connected';
+      if (pendingOfflineRetry) {
+        const action = pendingOfflineRetry;
+        pendingOfflineRetry = null;
+        const offlineNotice = document.getElementById('offlineNoticeRow');
+        if (offlineNotice) offlineNotice.remove();
+        if (typeof action === 'function') action();
+      } else {
+        const offlineNotice = document.getElementById('offlineNoticeRow');
+        if (offlineNotice) offlineNotice.remove();
+        if (activePolls && Object.keys(activePolls).length > 0) {
+          if (!document.querySelector('.generating')) {
+            appendTyping();
+          }
+        }
+      }
     } else {
       netPill.className = 'net-pill offline';
       netPill.innerHTML = '<span class="dot"></span> No Internet';
+      const genBubble = document.querySelector('.generating');
+      if (genBubble) {
+        document.querySelectorAll('.generating').forEach(el => {
+          const msgAi = el.closest('.msg.ai');
+          if (msgAi) msgAi.remove();
+        });
+        const offlineNotice = document.getElementById('offlineNoticeRow');
+        if (!offlineNotice) {
+          appendOfflineErrorNotice();
+        }
+      }
     }
   }
   updateNet();
@@ -237,13 +265,16 @@
           fd.append('csrf_token', csrfToken());
           fd.append('id', target.id);
           try {
-            await apiFetch('POST', 'api.php?action=archive_restore', fd);
+            const restoreRes = await apiFetch('POST', 'api.php?action=archive_restore', fd);
+            const restoreData = await restoreRes.json();
             archiveLoaded = false; historyLoaded = false;
             loadArchive();
             if (historyOpen) loadHistory();
-            if (currentHistoryId === target.id && currentHistorySource === 'archive') {
-              currentHistoryId = null;
-              currentHistorySource = null;
+            // Open the newly restored session so user can continue where they left off
+            if (restoreData.ok && restoreData.new_id) {
+              openHistory(restoreData.new_id, 'history');
+            } else if (currentHistoryId == target.id) {
+              resetChat();
             }
           } catch { /* silent */ }
         } else if (target.type === 'trash') {
@@ -605,22 +636,39 @@
       });
 
       // Restore currentMode based on history so new requests use correct mode/cost
-      const lastAiMessage = stored.slice().reverse().find(m => m.role === 'ai');
-      if (lastAiMessage) {
-        if (lastAiMessage.type === 'quiz') {
-          currentMode = 'quiz';
-        } else if (lastAiMessage.type === 'lesson') {
-          currentMode = 'lesson';
+      if (messages.length > 0) {
+        const lastAiMessage = messages.slice().reverse().find(m => m.role === 'ai');
+        if (lastAiMessage) {
+          if (lastAiMessage.type === 'quiz') {
+            currentMode = 'quiz';
+          } else {
+            currentMode = 'lesson';
+          }
+        } else {
+          const lastUserMessage = messages.slice().reverse().find(m => m.role === 'user');
+          if (lastUserMessage && lastUserMessage.requestedMode) {
+            currentMode = lastUserMessage.requestedMode;
+          }
         }
+      }
+
+      // Update the UI toggle to match the restored mode
+      if (currentMode) {
+        document.querySelectorAll('.mode-toggle button').forEach(b => b.classList.remove('active'));
+        const targetBtn = document.querySelector(`.mode-toggle button[data-mode="${currentMode}"]`);
+        if (targetBtn) targetBtn.classList.add('active');
       }
 
       const isLastError = stored.length > 0 && (
         stored[stored.length - 1].type === 'error' ||
         (stored[stored.length - 1].html && stored[stored.length - 1].html.includes('Background generation failed'))
       );
+      const isLastLimit = stored.length > 0 && stored[stored.length - 1].type === 'error_limit';
 
       if (isLastError && data.item.generation_status !== 'processing') {
         appendActionButtons('error');
+      } else if (isLastLimit && data.item.generation_status !== 'processing') {
+        retryGeneration();
       } else if (activeQuiz && activeQuiz.completed && data.item.generation_status !== 'processing') {
         appendActionButtons('quiz_done');
       } else if (lastLesson && data.item.generation_status !== 'processing') {
@@ -633,6 +681,10 @@
       if (data.item.generation_status === 'processing') {
         appendTyping();
         startPolling(id);
+      } else if (data.item.generation_status === 'pending_retry') {
+        // Session was archived while AI was still generating, then restored.
+        // The original background worker lost its reference, so we need to re-trigger.
+        autoRetryRestoredSession(id);
       }
 
       wrap.scrollTop = wrap.scrollHeight;
@@ -958,17 +1010,25 @@
     fd.append('csrf_token', csrfToken());
     fd.append('id', archivingId);
     try {
-      await apiFetch('POST', 'api.php?action=archive_add', fd);
-      historyLoaded = false; pinnedLoaded = false; archiveLoaded = false;
-      if (historyOpen) loadHistory();
-      if (pinnedOpen) loadPinned();
-      if (archiveOpen) loadArchive();
+      const res = await apiFetch('POST', 'api.php?action=archive_add', fd);
+      const result = await res.json().catch(() => ({}));
 
-      // If the archived session was the one currently open, navigate home
-      if (currentHistoryId === archivingId) {
-        resetChat();
+      if (res.ok && result.ok) {
+        historyLoaded = false; pinnedLoaded = false; archiveLoaded = false;
+        if (historyOpen) loadHistory();
+        if (pinnedOpen) loadPinned();
+        if (archiveOpen) loadArchive();
+
+        // If the archived session was the one currently open, navigate home
+        if (currentHistoryId == archivingId) {
+          resetChat();
+        }
+      } else {
+        throw new Error(result.message || 'Could not archive session.');
       }
-    } catch { /* silent */ }
+    } catch (err) {
+      showToast(err.message || 'Could not archive session.', 'error');
+    }
     if (archiveModal) archiveModal.style.display = 'none';
     pendingArchiveId = null;
   });
@@ -1120,7 +1180,7 @@
   };
 
   /* ── Chat state ──────────────────────────────────────────── */
-  const messages = [];
+  let messages = [];
   let lastLessonText = '';
   let activeQuiz = null;
 
@@ -1223,8 +1283,13 @@
     const fileForRequest = pendingFile;
     const imageDataForMsg = pendingImageDataUrl;
 
+    // Determine mode FIRST
+    const isQuizFromLesson = lastLessonText !== '' && (/quiz/i.test(topic) || /test me/i.test(topic) || /questions/i.test(topic));
+    const isQuizRequest = currentMode === 'quiz' || /\bquiz\b/i.test(topic) || /\btest me\b/i.test(topic) || /\bquestions?\b/i.test(topic);
+    const mode = isQuizRequest ? 'quiz' : currentMode;
+
     // Build user message
-    const userMsgData = { role: 'user', text: topic };
+    const userMsgData = { role: 'user', text: topic, requestedMode: mode };
 
     if (fileForRequest) {
       userMsgData.fileName = fileForRequest.name;
@@ -1254,11 +1319,6 @@
       if (idx !== -1) { handleQuizAnswer(idx); return; }
     }
 
-    // Determine mode
-    const isQuizFromLesson = lastLessonText !== '' && (/quiz/i.test(topic) || /test me/i.test(topic) || /questions/i.test(topic));
-    const isQuizRequest = currentMode === 'quiz' || /\bquiz\b/i.test(topic) || /\btest me\b/i.test(topic) || /\bquestions?\b/i.test(topic);
-    const mode = isQuizRequest ? 'quiz' : currentMode;
-
     let effectiveTopic = topic;
     if (!effectiveTopic && fileForRequest) {
       effectiveTopic = fileForRequest.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ').trim();
@@ -1280,10 +1340,17 @@
     fd.append('title', titleText);
     fd.append('messages', JSON.stringify(cleanMessages));
 
-    lastFailedPayload = { effectiveTopic, mode, fileForRequest: null };
+    lastFailedPayload = { effectiveTopic, mode, fileForRequest };
 
     const typingId = appendTyping();
     const activeChatAtRequestTime = currentHistoryId;
+
+    if (!navigator.onLine) {
+      removeMessage(typingId);
+      appendOfflineErrorNotice();
+      pendingOfflineRetry = window.retryGeneration;
+      return;
+    }
 
     try {
       let res;
@@ -1292,7 +1359,10 @@
       } catch (err) {
         clearTimeout(timer);
         removeMessage(typingId);
-        if (err.name === 'AbortError') {
+        if (!navigator.onLine) {
+          appendOfflineErrorNotice();
+          pendingOfflineRetry = window.retryGeneration;
+        } else if (err.name === 'AbortError') {
           appendErrorNotice('Gemini took too long.');
         } else {
           appendErrorNotice('Network error. Please check your connection.');
@@ -1387,6 +1457,7 @@
 
     const row = document.createElement('div');
     row.className = 'error-notice-row';
+    row.id = 'genericErrorRow';
 
     let html = `
       <div class="error-pill">
@@ -1395,13 +1466,42 @@
     `;
     if (showRetry) {
       html += `
-        <button class="retry-inline-btn" onclick="retryLast()">
+        <button class="retry-inline-btn" onclick="window.retryGeneration()">
           <span class="material-icons" style="font-size:16px;">refresh</span> Retry
         </button>
       `;
     }
     html += `</div>`;
 
+    row.innerHTML = html;
+    wrap.appendChild(row);
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  function appendOfflineErrorNotice() {
+    const wrap = $('messagesWrap');
+    if (!wrap) return;
+
+    // Remove any existing offline notice specifically to avoid duplicates
+    const oldNotice = document.getElementById('offlineNoticeRow');
+    if (oldNotice) oldNotice.remove();
+    
+    // Also remove any existing generic error at the end to keep UI clean
+    const existing = wrap.lastElementChild;
+    if (existing && existing.classList.contains('error-notice-row')) {
+      existing.remove();
+    }
+
+    const row = document.createElement('div');
+    row.className = 'error-notice-row';
+    row.id = 'offlineNoticeRow';
+
+    let html = `
+      <div class="error-pill">
+        <span class="material-icons" style="font-size:18px;">wifi_off</span>
+        <span>no internet connection, please return again if connection is available</span>
+      </div>
+    `;
     row.innerHTML = html;
     wrap.appendChild(row);
     wrap.scrollTop = wrap.scrollHeight;
@@ -1438,20 +1538,20 @@
         row.remove();
         currentMode = 'quiz';
         appendMessage('user', '<span class="material-icons" style="font-size:18px;vertical-align:middle;margin-right:4px;">assignment</span> Generate a 20-question quiz based on this lesson.');
-        messages.push({ role: 'user', text: 'Generate a 20-question quiz based on this lesson.' });
+        messages.push({ role: 'user', text: 'Generate a 20-question quiz based on this lesson.', requestedMode: 'quiz' });
         triggerQuizFromLesson();
       });
       row.querySelector('#btnMoreLesson')?.addEventListener('click', () => {
         row.remove();
         currentMode = 'lesson';
         appendMessage('user', '<span class="material-icons" style="font-size:18px;vertical-align:middle;margin-right:4px;">auto_stories</span> Give me a simpler explanation with more examples.');
-        messages.push({ role: 'user', text: 'Give me a simpler explanation with more examples.' });
+        messages.push({ role: 'user', text: 'Give me a simpler explanation with more examples.', requestedMode: 'lesson' });
         triggerMoreLesson();
       });
 
     } else if (context === 'error') {
       row.innerHTML = `
-        <span style="font-size:0.8rem;color:var(--gray);font-weight:500">Generation failed.</span>
+        <span style="font-size:0.8rem;color:var(--gray);font-weight:500">No Connection</span>
         <button class="action-pill ripple" id="btnRetry">
           <span class="material-icons" style="font-size:18px;vertical-align:middle;margin-right:4px;">refresh</span> Retry
         </button>`;
@@ -1507,7 +1607,7 @@
       row.querySelector('#btnQuizAgain')?.addEventListener('click', () => {
         row.remove();
         appendMessage('user', '<span class="material-icons" style="font-size:18px;vertical-align:middle;margin-right:4px;">assignment</span> Take the quiz again.');
-        messages.push({ role: 'user', text: 'Take the quiz again.' });
+        messages.push({ role: 'user', text: 'Take the quiz again.', requestedMode: 'quiz' });
         triggerQuizFromLesson();
       });
       row.querySelector('#btnMoreLesson2')?.addEventListener('click', () => {
@@ -1523,32 +1623,64 @@
   /* ── Retry Generation ────────────────────────────────────── */
   window.retryGeneration = async function retryGeneration() {
     // Remove the error message from the frontend state (supports legacy errors too)
-    messages = messages.filter(m => m.type !== 'error' && !(m.html && m.html.includes('Background generation failed')));
+    messages = messages.filter(m => m.type !== 'error' && m.type !== 'error_limit' && !(m.html && m.html.includes('Background generation failed')));
 
-    // Clean up DOM: Remove the error message div
+    // Clean up DOM: Remove specific error rows
+    const genericErr = document.getElementById('genericErrorRow');
+    if (genericErr) genericErr.remove();
+    const offlineNotice = document.getElementById('offlineNoticeRow');
+    if (offlineNotice) offlineNotice.remove();
+    
+    // Legacy cleanup
     const errNodes = document.querySelectorAll('.msg.ai, .error-notice-row');
     errNodes.forEach(node => {
-      if (node.innerHTML.includes('warning') && (node.innerHTML.includes('failed') || node.innerHTML.includes('Failed'))) {
+      if (node.innerHTML.includes('warning') && (node.innerHTML.includes('failed') || node.innerHTML.includes('Failed') || node.innerHTML.includes('internet connection'))) {
         node.remove();
       }
     });
 
+    const limitWarn = document.getElementById('limitWarn');
+    if (limitWarn) limitWarn.remove();
+    document.querySelectorAll('.post-action-row').forEach(r => r.remove());
+
     // Find the last user message to use as the prompt/title
     const lastUserMsg = messages.slice().reverse().find(m => m.role === 'user');
-    const prompt = lastUserMsg ? (lastUserMsg.text || 'Retry generation') : 'Retry';
-    const isQuizFromLesson = lastLessonText !== '' && (/quiz/i.test(prompt) || /test me/i.test(prompt) || /questions/i.test(prompt));
+    let prompt = lastUserMsg ? (lastUserMsg.text || '') : '';
+    let fileForRetry = null;
+    
+    if (lastFailedPayload) {
+      prompt = lastFailedPayload.effectiveTopic;
+      fileForRetry = lastFailedPayload.fileForRequest;
+    } else if (!prompt) {
+      prompt = 'Retry generation';
+    }
+
     const isQuizRequest = currentMode === 'quiz' || /\bquiz\b/i.test(prompt) || /\btest me\b/i.test(prompt) || /\bquestions?\b/i.test(prompt);
     const mode = isQuizRequest ? 'quiz' : (currentMode || 'lesson');
+    const isQuizFromLesson = lastLessonText !== '' && mode === 'quiz';
 
-    await saveHistory(); // Overwrite the DB without the error message
+    try { await saveHistory(); } catch(e) {} // Safely overwrite DB without blocking
 
     const typingId = appendTyping();
     const activeChatAtRequestTime = currentHistoryId;
 
+    if (!navigator.onLine) {
+      removeMessage(typingId);
+      appendOfflineErrorNotice();
+      pendingOfflineRetry = window.retryGeneration;
+      return;
+    }
+
     try {
-      // Pass empty string for topic since the last user message is already in the 'messages' array!
-      // This prevents api.php from appending a duplicate user message which causes Gemini API to crash.
-      const fd = buildFormData('', mode, null);
+      // Pass the prompt for the topic so api.php doesn't throw an error.
+      let effectivePrompt = prompt;
+      if (isQuizFromLesson && !prompt.includes('\n')) {
+        effectivePrompt = lastLessonText + (prompt ? '\n\nUser request: ' + prompt : '');
+      } else if (mode === 'lesson' && lastLessonText !== '' && prompt === 'Give me a simpler explanation with more examples.') {
+        effectivePrompt = lastLessonText + '\n\n---\nUser request: Please provide a more in-depth yet simpler explanation. Add more examples, analogies, and break down complex concepts further. Target a complete beginner.';
+      }
+
+      const fd = buildFormData(effectivePrompt, mode, fileForRetry);
 
       const cleanMessages = messages.map(m => {
         if (m.imageDataUrl) { const { imageDataUrl, ...rest } = m; return rest; }
@@ -1576,7 +1708,76 @@
       }
     } catch (err) {
       removeMessage(typingId);
-      appendErrorNotice(err.message || 'Could not retry generation.');
+      if (!navigator.onLine) {
+        appendOfflineErrorNotice();
+        pendingOfflineRetry = window.retryGeneration;
+      } else {
+        appendErrorNotice(err.message || 'Could not retry generation.');
+      }
+    }
+  }
+
+  /* ── Auto-retry for restored sessions (archived mid-generation) ── */
+  async function autoRetryRestoredSession(historyId) {
+    // Find the last user message to determine what to re-generate
+    const lastUserMsg = messages.slice().reverse().find(m => m.role === 'user');
+    if (!lastUserMsg) return; // Nothing to retry
+
+    const prompt = lastUserMsg.text || '';
+    const isQuizRequest = currentMode === 'quiz' || /\bquiz\b/i.test(prompt) || /\btest me\b/i.test(prompt) || /\bquestions?\b/i.test(prompt);
+    const mode = isQuizRequest ? 'quiz' : (currentMode || 'lesson');
+
+    const isQuizFromLesson = lastLessonText !== '' && mode === 'quiz';
+    let effectivePrompt = prompt;
+    if (isQuizFromLesson && !prompt.includes('\n')) {
+      effectivePrompt = lastLessonText + (prompt ? '\n\nUser request: ' + prompt : '');
+    } else if (mode === 'lesson' && lastLessonText !== '' && prompt === 'Give me a simpler explanation with more examples.') {
+      effectivePrompt = lastLessonText + '\n\n---\nUser request: Please provide a more in-depth yet simpler explanation. Add more examples, analogies, and break down complex concepts further. Target a complete beginner.';
+    }
+
+    const typingId = appendTyping();
+
+    try {
+      const fd = buildFormData(effectivePrompt, mode, null);
+
+      const cleanMessages = messages.map(m => {
+        if (m.imageDataUrl) { const { imageDataUrl, ...rest } = m; return rest; }
+        return m;
+      });
+      const titleText = (lastUserMsg.text || lastUserMsg.fileName || 'Study Session').substring(0, 80);
+      fd.append('history_id', historyId);
+      fd.append('title', titleText);
+      fd.append('messages', JSON.stringify(cleanMessages));
+
+      const res = await apiFetch('POST', 'api.php?action=ai', fd);
+      let data;
+      try { data = JSON.parse(await res.text()); }
+      catch { removeMessage(typingId); appendErrorNotice('Unexpected response. Please try again.'); return; }
+
+      if (!data.ok) {
+        removeMessage(typingId);
+        if (data.limited) { showLimit(data.message, data.resetAt); appendActionButtons('error_limit'); }
+        else appendErrorNotice(data.message || 'Something went wrong.');
+        return;
+      }
+
+      if (data.history_id) {
+        currentHistoryId = data.history_id;
+        currentHistorySource = 'history';
+        localStorage.setItem('activeHistoryId', currentHistoryId);
+      }
+
+      if (data.status === 'processing') {
+        startPolling(data.history_id);
+      }
+    } catch (err) {
+      removeMessage(typingId);
+      if (!navigator.onLine) {
+        appendOfflineErrorNotice();
+        pendingOfflineRetry = () => autoRetryRestoredSession(historyId);
+      } else {
+        appendErrorNotice(err.message || 'Could not resume generation.');
+      }
     }
   }
 
@@ -1642,7 +1843,12 @@
       }
     } catch (err) {
       removeMessage(typingId);
-      appendErrorNotice(err.message || 'Could not generate quiz.');
+      if (!navigator.onLine) {
+        appendOfflineErrorNotice();
+        pendingOfflineRetry = triggerQuizFromLesson;
+      } else {
+        appendErrorNotice(err.message || 'Could not generate quiz.');
+      }
     }
   }
 
@@ -2037,7 +2243,18 @@
   function apiFetch(method, url, body = null, signal = null) {
     const opts = { method, signal };
     if (body) opts.body = body;
-    return fetch(url, opts);
+    return fetch(url, opts).then(async res => {
+      if (res.status === 403) {
+        try {
+          const clone = res.clone();
+          const data = await clone.json();
+          if (data.suspended) {
+            window.location.href = 'dashboard.php';
+          }
+        } catch (e) {}
+      }
+      return res;
+    });
   }
 
   /* ── Settings UI Interactions ──────────────────────────────── */
@@ -2317,7 +2534,7 @@
   });
 
 
-  const activePolls = {};
+  var activePolls = {};
   function startPolling(id) {
     if (activePolls[id]) return;
     activePolls[id] = setInterval(async () => {
@@ -2346,5 +2563,212 @@
   if (savedId) {
     openHistory(savedId, 'history');
   }
+
+  /* ════════════════════════════════════════════════════════════
+     RATINGS & FEEDBACK
+     ════════════════════════════════════════════════════════════ */
+  
+  // Toast notifications
+  function showToast(message, type = 'success') {
+    let container = $('toastContainer');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'toastContainer';
+      document.body.appendChild(container);
+    }
+    
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    const icon = type === 'success' ? 'check_circle' : 'error';
+    toast.innerHTML = `<span class="material-icons">${icon}</span><span>${escHtml(message)}</span>`;
+    
+    container.appendChild(toast);
+    
+    // trigger animation
+    setTimeout(() => toast.classList.add('show'), 10);
+    
+    // auto remove
+    setTimeout(() => {
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 300);
+    }, 4000);
+  }
+
+  // Rate Us Modal
+  const rateUsModal = $('rateUsModal');
+  let currentRating = 0;
+  
+  $('openRateUsBtn')?.addEventListener('click', () => {
+    currentRating = 0;
+    document.querySelectorAll('.star-rating .star').forEach(s => {
+      s.textContent = 'star_border';
+      s.classList.remove('active');
+    });
+    const err = $('ratingError');
+    if (err) err.textContent = '';
+    if (rateUsModal) rateUsModal.style.display = 'flex';
+  });
+
+  $('closeRateUsModal')?.addEventListener('click', () => { if (rateUsModal) rateUsModal.style.display = 'none'; });
+  $('cancelRateUs')?.addEventListener('click', () => { if (rateUsModal) rateUsModal.style.display = 'none'; });
+  
+  const stars = document.querySelectorAll('.star-rating .star');
+  stars.forEach(star => {
+    star.addEventListener('mouseover', function() {
+      const val = parseInt(this.dataset.value);
+      stars.forEach(s => {
+        if (parseInt(s.dataset.value) <= val) {
+          s.textContent = 'star';
+          s.classList.add('hover');
+        } else {
+          if (!s.classList.contains('active')) s.textContent = 'star_border';
+          s.classList.remove('hover');
+        }
+      });
+    });
+    
+    star.addEventListener('mouseout', function() {
+      stars.forEach(s => {
+        s.classList.remove('hover');
+        s.textContent = parseInt(s.dataset.value) <= currentRating ? 'star' : 'star_border';
+      });
+    });
+    
+    star.addEventListener('click', function() {
+      currentRating = parseInt(this.dataset.value);
+      stars.forEach(s => {
+        s.classList.toggle('active', parseInt(s.dataset.value) <= currentRating);
+      });
+      const err = $('ratingError');
+      if (err) err.textContent = '';
+    });
+  });
+
+  $('submitRateUs')?.addEventListener('click', async () => {
+    if (currentRating < 1 || currentRating > 5) {
+      const err = $('ratingError');
+      if (err) err.textContent = 'Please select a rating.';
+      return;
+    }
+    const btn = $('submitRateUs');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<span class="material-icons" style="animation: spin 1s linear infinite;">autorenew</span> Submitting...';
+    btn.disabled = true;
+    
+    try {
+      const res = await fetch('api.php?action=submit_rating', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken() },
+        body: JSON.stringify({ rating: currentRating })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast(data.message || 'Thank you for your rating!', 'success');
+        if (rateUsModal) rateUsModal.style.display = 'none';
+      } else {
+        showToast(data.message || 'Submission failed.', 'error');
+      }
+    } catch (e) {
+      showToast('A network error occurred.', 'error');
+    } finally {
+      btn.innerHTML = originalText;
+      btn.disabled = false;
+    }
+  });
+
+  // Feedback Modal
+  const feedbackModal = $('sendFeedbackModal');
+  const feedbackTextarea = $('feedbackTextarea');
+  const feedbackWordCount = $('feedbackWordCount');
+  const submitFeedback = $('submitFeedback');
+  
+  $('openFeedbackBtn')?.addEventListener('click', () => {
+    if (feedbackTextarea) feedbackTextarea.value = '';
+    if (feedbackWordCount) {
+      feedbackWordCount.textContent = '0 / 300 words';
+      feedbackWordCount.style.color = 'var(--gray)';
+    }
+    if (submitFeedback) {
+      submitFeedback.disabled = true;
+      submitFeedback.style.opacity = '0.5';
+      submitFeedback.style.cursor = 'not-allowed';
+    }
+    if (feedbackModal) feedbackModal.style.display = 'flex';
+  });
+
+  $('closeFeedbackModal')?.addEventListener('click', () => { if (feedbackModal) feedbackModal.style.display = 'none'; });
+  $('cancelFeedback')?.addEventListener('click', () => { if (feedbackModal) feedbackModal.style.display = 'none'; });
+  
+  if (feedbackTextarea) {
+    feedbackTextarea.addEventListener('input', function() {
+      const text = this.value.trim();
+      const words = text.length > 0 ? text.split(/\s+/).length : 0;
+      if (feedbackWordCount) {
+        feedbackWordCount.textContent = `${words} / 300 words`;
+        if (words > 300) {
+          feedbackWordCount.style.color = 'var(--red)';
+        } else {
+          feedbackWordCount.style.color = 'var(--gray)';
+        }
+      }
+      if (submitFeedback) {
+        if (words > 0 && words <= 300) {
+          submitFeedback.disabled = false;
+          submitFeedback.style.opacity = '1';
+          submitFeedback.style.cursor = 'pointer';
+        } else {
+          submitFeedback.disabled = true;
+          submitFeedback.style.opacity = '0.5';
+          submitFeedback.style.cursor = 'not-allowed';
+        }
+      }
+    });
+  }
+
+  $('submitFeedback')?.addEventListener('click', async () => {
+    const text = feedbackTextarea.value.trim();
+    if (!text) return;
+    
+    const btn = $('submitFeedback');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<span class="material-icons" style="animation: spin 1s linear infinite;">autorenew</span> Submitting...';
+    btn.disabled = true;
+    
+    try {
+      const res = await fetch('api.php?action=submit_feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken() },
+        body: JSON.stringify({ message: text })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast(data.message || 'Thank you for your feedback!', 'success');
+        if (feedbackModal) feedbackModal.style.display = 'none';
+      } else {
+        showToast(data.message || 'Submission failed.', 'error');
+      }
+    } catch (e) {
+      showToast('A network error occurred.', 'error');
+    } finally {
+      btn.innerHTML = originalText;
+      btn.disabled = false;
+    }
+  });
+
+  // Modal ESC key & outside click handling
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      if (rateUsModal && rateUsModal.style.display !== 'none') rateUsModal.style.display = 'none';
+      if (feedbackModal && feedbackModal.style.display !== 'none') feedbackModal.style.display = 'none';
+    }
+  });
+  
+  [rateUsModal, feedbackModal].forEach(modal => {
+    if (modal) {
+      modal.addEventListener('click', e => {
+        if (e.target === modal) modal.style.display = 'none';
+      });
+    }
+  });
 
 })();

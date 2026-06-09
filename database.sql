@@ -84,3 +84,19 @@ CREATE TABLE IF NOT EXISTS ai_cache (
 
 -- Migration helper: add trash table if upgrading an existing install
 -- (safe to run even if table already exists due to IF NOT EXISTS above)
+
+CREATE TABLE IF NOT EXISTS ratings (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    user_id    INT            NULL,
+    rating     INT            NOT NULL,
+    created_at TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    user_id    INT            NULL,
+    message    TEXT           NOT NULL,
+    created_at TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);

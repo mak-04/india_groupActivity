@@ -14,3 +14,17 @@ if (!empty($_COOKIE['remember_token']) && empty($_SESSION['user_id'])) {
         $_SESSION['user_id'] = (int) $user['id'];
     }
 }
+
+// Track online status
+if (!empty($_SESSION['user_id'])) {
+    $sessHash = session_id();
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    
+    $stmt = db()->prepare("UPDATE user_sessions SET last_activity = NOW(), ip_address = ? WHERE session_hash = ?");
+    $stmt->execute([$ip, $sessHash]);
+    
+    if ($stmt->rowCount() === 0) {
+        db()->prepare("INSERT IGNORE INTO user_sessions (user_id, session_hash, ip_address) VALUES (?, ?, ?)")
+            ->execute([$_SESSION['user_id'], $sessHash, $ip]);
+    }
+}
